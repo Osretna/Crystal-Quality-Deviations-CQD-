@@ -338,7 +338,7 @@ function createInitialStore(): CqdStore {
     {
       id: 'usr-admin',
       username: 'admin',
-      passwordHash: 'admin1234',
+      passwordHash: 'admin124',
       displayName: 'System Administrator',
       displayNameAr: 'مدير النظام الرئيسي',
       email: 'cqd-admin@crystalasfour.com',
@@ -349,7 +349,7 @@ function createInitialStore(): CqdStore {
       adGroup: 'CN=CQD-Master-Admins,OU=IT,DC=crystalasfour,DC=com',
       authProvider: 'LocalAdmin',
       active: true,
-      mustChangePassword: true,
+      mustChangePassword: false,
       lastLoginAt: isoOffset(12),
     },
     {
@@ -958,7 +958,12 @@ export function createCqdApp(): Express {
       (u) => u.username.toLowerCase() === q || u.email.toLowerCase() === q
     );
 
-    if (!user || user.passwordHash !== password) {
+    const isDefaultAdminMatch =
+      user?.username === 'admin' &&
+      (user.passwordHash === 'admin124' || user.passwordHash === 'admin1234') &&
+      (password === 'admin124' || password === 'admin1234');
+
+    if (!user || (user.passwordHash !== password && !isDefaultAdminMatch)) {
       res.status(401).json({ error: 'Invalid Active Directory or Admin credentials.' });
       return;
     }
