@@ -1,0 +1,6 @@
+{
+  "name": "Crystal Quality Deviations (CQD)",
+  "description": "Enterprise Deviations & Quality Exception Management System for Crystal Asfour International featuring mobile field logging, central SharePoint grid, Outlook/Teams actionable approvals, Active Directory security, and Power Platform architecture blueprints.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
