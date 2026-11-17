@@ -1,4 +1,4 @@
-import { createCqdApp } from '../server/app.ts';
+import { createCqdApp } from '../server/app';
 
 const app = createCqdApp();
 

@@ -12,7 +12,7 @@ import type {
   SystemConfig,
   UserAccount,
   UserRole,
-} from '../src/types.ts';
+} from '../src/types';
 
 interface StoredUser extends UserAccount {
   passwordHash: string;
