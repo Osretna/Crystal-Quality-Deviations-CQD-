@@ -12,7 +12,7 @@ import type {
   SystemConfig,
   UserAccount,
   UserRole,
-} from '../src/types';
+} from '../src/types.js';
 
 interface StoredUser extends UserAccount {
   passwordHash: string;
@@ -32,9 +32,10 @@ const ssoSessions = new Map<string, { username: string; expiresAt: number }>();
 let memoryStoreCache: CqdStore | null = null;
 
 function getDbFilePath(): string {
+  const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
   const baseDir =
     process.env.CQD_DATA_DIR ||
-    (process.env.VERCEL === '1' ? '/tmp/cqd-data' : path.join(process.cwd(), 'data'));
+    (isVercel ? '/tmp/cqd-data' : path.join(process.cwd(), 'data'));
   return path.join(baseDir, 'cqd-store.json');
 }
 

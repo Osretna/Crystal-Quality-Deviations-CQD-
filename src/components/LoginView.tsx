@@ -72,13 +72,19 @@ export function LoginView({ lang, onToggleLang, onAuthenticated }: LoginViewProp
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: username.trim(), password }),
       });
-      const data = (await res.json()) as { user?: UserAccount; error?: string };
+      const rawText = await res.text();
+      let data: { user?: UserAccount; error?: string } = {};
+      try {
+        data = JSON.parse(rawText) as { user?: UserAccount; error?: string };
+      } catch {
+        // Non-JSON error response
+      }
       if (!res.ok || !data.user) {
         setError(
           data.error ||
             (lang === 'ar'
-              ? 'اسم المستخدم أو كلمة المرور غير صحيحة.'
-              : 'Invalid username or password.')
+              ? `فشل تسجيل الدخول (رمز الحالة ${res.status}).`
+              : `Authentication failed (HTTP ${res.status}).`)
         );
         return;
       }

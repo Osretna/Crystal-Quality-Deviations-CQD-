@@ -1,4 +1,4 @@
-import { createCqdApp } from '../server/app';
+import { createCqdApp } from '../server/app.js';
 
 const app = createCqdApp();
 
