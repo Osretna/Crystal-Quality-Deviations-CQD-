@@ -2,6 +2,7 @@ import express, { type Express } from 'express';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { Client as LdapClient } from 'ldapts';
 import type {
   AdDirectoryCandidate,
   AppPermissions,
@@ -768,34 +769,51 @@ function sanitizeUser(user: StoredUser): UserAccount {
 }
 
 function sanitizeConfig(store: CqdStore): SystemConfig {
-  const tenantId = process.env.AZURE_AD_TENANT_ID || store.config.adSync.tenantId || '';
-  const clientId = process.env.AZURE_AD_CLIENT_ID || store.config.adSync.clientId || '';
-  const hasSecret = Boolean(process.env.AZURE_AD_CLIENT_SECRET || store.adClientSecret);
-  const hasBindPass = Boolean(store.adBindPassword);
+  const creds = getAzureCredentials(store);
+  const ldap = getLdapConfig(store);
   return {
     ...store.config,
     adSync: {
       ...store.config.adSync,
-      tenantId,
-      clientId,
-      hasClientSecret: hasSecret,
+      tenantDomain: ldap.domain,
+      ldapEndpoint: ldap.ldapUrl,
+      baseDn: ldap.baseDn,
+      bindDn: ldap.bindDn,
+      tenantId: creds.tenantId,
+      clientId: creds.clientId,
+      hasClientSecret: Boolean(creds.clientSecret),
       clientSecretInput: undefined,
-      hasBindPassword: hasBindPass,
+      hasBindPassword: Boolean(ldap.bindPassword),
       bindPasswordInput: undefined,
     },
   };
 }
 
 function getAzureCredentials(store: CqdStore) {
-  const tenantId = (process.env.AZURE_AD_TENANT_ID || store.config.adSync.tenantId || '').trim();
-  const clientId = (process.env.AZURE_AD_CLIENT_ID || store.config.adSync.clientId || '').trim();
+  const tenantId = (
+    process.env.AZURE_AD_TENANT_ID ||
+    process.env.AZURE_TENANT_ID ||
+    process.env.TENANT_ID ||
+    store.config.adSync.tenantId ||
+    ''
+  ).trim();
+  const clientId = (
+    process.env.AZURE_AD_CLIENT_ID ||
+    process.env.AZURE_CLIENT_ID ||
+    process.env.CLIENT_ID ||
+    store.config.adSync.clientId ||
+    ''
+  ).trim();
   const clientSecret = (
     process.env.AZURE_AD_CLIENT_SECRET ||
+    process.env.AZURE_CLIENT_SECRET ||
+    process.env.CLIENT_SECRET ||
     store.adClientSecret ||
     ''
   ).trim();
   const redirectUri = (
     process.env.AZURE_AD_REDIRECT_URI ||
+    process.env.AZURE_REDIRECT_URI ||
     store.config.adSync.redirectUri ||
     ''
   ).trim();
@@ -805,7 +823,380 @@ function getAzureCredentials(store: CqdStore) {
     clientSecret,
     redirectUri,
     isConfigured: Boolean(tenantId && clientId && clientSecret),
+    hasTenantAndClient: Boolean(tenantId && clientId),
   };
+}
+
+function getLdapConfig(store: CqdStore) {
+  const domain = (
+    process.env.AD_DOMAIN ||
+    process.env.TENANT_DOMAIN ||
+    store.config.adSync.tenantDomain ||
+    'crystalasfour.com'
+  ).trim();
+  const ldapUrl = (
+    process.env.LDAP_URL ||
+    process.env.LDAP_ENDPOINT ||
+    process.env.AD_LDAP_URL ||
+    store.config.adSync.ldapEndpoint ||
+    (store.config.adSync.domainControllerIp
+      ? `ldaps://${store.config.adSync.domainControllerIp.trim()}:636`
+      : '')
+  ).trim();
+  const baseDn = (
+    process.env.LDAP_BASE_DN ||
+    process.env.AD_BASE_DN ||
+    store.config.adSync.baseDn ||
+    ''
+  ).trim();
+  const bindDn = (
+    process.env.LDAP_BIND_DN ||
+    process.env.AD_BIND_DN ||
+    store.config.adSync.bindDn ||
+    ''
+  ).trim();
+  const bindPassword = (
+    process.env.LDAP_BIND_PASSWORD ||
+    process.env.AD_BIND_PASSWORD ||
+    store.adBindPassword ||
+    ''
+  ).trim();
+  return {
+    domain,
+    ldapUrl,
+    baseDn,
+    bindDn,
+    bindPassword,
+    isConfigured: Boolean(ldapUrl && baseDn),
+  };
+}
+
+function escapeLdapFilter(value: string): string {
+  return value.replace(/[\\*()\0]/g, (ch) => {
+    const hex = ch.charCodeAt(0).toString(16).padStart(2, '0');
+    return `\\${hex}`;
+  });
+}
+
+function normalizeUsernameInput(raw: string): {
+  rawLower: string;
+  bare: string;
+  domainPrefix: string;
+  hasDomainAt: boolean;
+} {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.includes('\\')) {
+    const parts = lower.split('\\');
+    return {
+      rawLower: lower,
+      bare: parts[parts.length - 1] || lower,
+      domainPrefix: parts[0] || '',
+      hasDomainAt: false,
+    };
+  }
+  if (lower.includes('@')) {
+    return {
+      rawLower: lower,
+      bare: lower.split('@')[0] || lower,
+      domainPrefix: '',
+      hasDomainAt: true,
+    };
+  }
+  return {
+    rawLower: lower,
+    bare: lower,
+    domainPrefix: '',
+    hasDomainAt: false,
+  };
+}
+
+function resolveRoleFromAdGroups(memberOf: unknown, config: SystemConfig): UserRole {
+  const list = Array.isArray(memberOf)
+    ? memberOf.map((v) => String(v).toLowerCase())
+    : typeof memberOf === 'string'
+    ? [memberOf.toLowerCase()]
+    : [];
+  const admins = (config.adSync.adminsGroupDn || '').toLowerCase();
+  const managers = (config.adSync.managersGroupDn || '').toLowerCase();
+  const inspectors = (config.adSync.inspectorsGroupDn || '').toLowerCase();
+  if (admins && list.some((g) => g.includes(admins) || g.includes('admin'))) return 'System Admin';
+  if (managers && list.some((g) => g.includes(managers) || g.includes('manager'))) {
+    return 'Production Manager';
+  }
+  if (inspectors && list.some((g) => g.includes(inspectors) || g.includes('inspector') || g.includes('qc'))) {
+    return 'Quality Inspector';
+  }
+  return 'Operator';
+}
+
+interface ExternalAdAuthResult {
+  ok: boolean;
+  mfaOrSsoRequired?: boolean;
+  unreachable?: boolean;
+  invalidCredentials?: boolean;
+  reason?: string;
+  profile?: {
+    username: string;
+    email: string;
+    displayName: string;
+    department: string;
+    jobTitle: string;
+    adGroup: string;
+    roleHint: UserRole;
+  };
+}
+
+async function authenticateViaEntraRopc(
+  store: CqdStore,
+  usernameInput: string,
+  password: string
+): Promise<ExternalAdAuthResult> {
+  const creds = getAzureCredentials(store);
+  if (!creds.hasTenantAndClient) return { ok: false };
+
+  const norm = normalizeUsernameInput(usernameInput);
+  const domain = getLdapConfig(store).domain;
+  const candidates = norm.hasDomainAt
+    ? [usernameInput.trim()]
+    : Array.from(new Set([`${norm.bare}@${domain}`, usernameInput.trim()]));
+
+  for (const candidate of candidates) {
+    try {
+      const body = new URLSearchParams({
+        client_id: creds.clientId,
+        scope: 'openid profile email User.Read',
+        username: candidate,
+        password,
+        grant_type: 'password',
+      });
+      if (creds.clientSecret) {
+        body.set('client_secret', creds.clientSecret);
+      }
+
+      const tokenRes = await fetch(
+        `https://login.microsoftonline.com/${encodeURIComponent(creds.tenantId)}/oauth2/v2.0/token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+        }
+      );
+
+      const json = (await tokenRes.json()) as {
+        access_token?: string;
+        error?: string;
+        error_description?: string;
+        error_codes?: number[];
+      };
+
+      if (tokenRes.ok && json.access_token) {
+        let email = candidate.toLowerCase();
+        let displayName = norm.bare;
+        let department = 'Crystal Asfour Operations';
+        let jobTitle = 'AD User';
+
+        try {
+          const meRes = await fetch('https://graph.microsoft.com/v1.0/me', {
+            headers: { Authorization: `Bearer ${json.access_token}` },
+          });
+          if (meRes.ok) {
+            const me = (await meRes.json()) as {
+              mail?: string;
+              userPrincipalName?: string;
+              displayName?: string;
+              department?: string;
+              jobTitle?: string;
+            };
+            email = (me.mail || me.userPrincipalName || email).toLowerCase();
+            displayName = me.displayName || displayName;
+            department = me.department || department;
+            jobTitle = me.jobTitle || jobTitle;
+          }
+        } catch {
+          // Non-fatal Graph profile fetch
+        }
+
+        return {
+          ok: true,
+          profile: {
+            username: email.split('@')[0] || norm.bare,
+            email,
+            displayName,
+            department,
+            jobTitle,
+            adGroup: `CN=EntraID-User,DC=${domain}`,
+            roleHint: 'Operator',
+          },
+        };
+      }
+
+      const codes = json.error_codes || [];
+      // MFA / Conditional Access / Consent required -> direct user to SSO button
+      if (
+        codes.some((c) => [50076, 50079, 53003, 65001, 7000218].includes(c)) ||
+        json.error === 'interaction_required'
+      ) {
+        return {
+          ok: false,
+          mfaOrSsoRequired: true,
+          reason:
+            'Microsoft Active Directory requires interactive SSO/MFA sign-in. Please use the Microsoft Active Directory SSO button below.',
+        };
+      }
+
+      if (codes.some((c) => [50126, 50034].includes(c)) || json.error === 'invalid_grant') {
+        return { ok: false, invalidCredentials: true };
+      }
+    } catch {
+      return { ok: false, unreachable: true };
+    }
+  }
+
+  return { ok: false };
+}
+
+async function authenticateViaLdap(
+  store: CqdStore,
+  usernameInput: string,
+  password: string
+): Promise<ExternalAdAuthResult> {
+  const ldapCfg = getLdapConfig(store);
+  if (!ldapCfg.isConfigured) return { ok: false };
+
+  const norm = normalizeUsernameInput(usernameInput);
+  const client = new LdapClient({
+    url: ldapCfg.ldapUrl,
+    timeout: 4000,
+    connectTimeout: 4000,
+    strictDN: false,
+    tlsOptions: { rejectUnauthorized: false },
+  });
+
+  try {
+    let foundEntry: Record<string, unknown> | null = null;
+    let userBound = false;
+
+    if (ldapCfg.bindDn && ldapCfg.bindPassword) {
+      await client.bind(ldapCfg.bindDn, ldapCfg.bindPassword);
+      const escBare = escapeLdapFilter(norm.bare);
+      const escRaw = escapeLdapFilter(usernameInput.trim());
+      const filter = `(&(objectClass=user)(|(sAMAccountName=${escBare})(userPrincipalName=${escRaw})(mail=${escRaw})))`;
+      const { searchEntries } = await client.search(ldapCfg.baseDn, {
+        scope: 'sub',
+        filter,
+        attributes: [
+          'dn',
+          'sAMAccountName',
+          'userPrincipalName',
+          'mail',
+          'displayName',
+          'cn',
+          'department',
+          'title',
+          'memberOf',
+        ],
+        sizeLimit: 2,
+      });
+
+      if (searchEntries.length > 0) {
+        foundEntry = searchEntries[0] as Record<string, unknown>;
+        const userDn = String(foundEntry.dn || '');
+        if (userDn) {
+          await client.bind(userDn, password);
+          userBound = true;
+        }
+      }
+    }
+
+    if (!userBound) {
+      const bindCandidates = Array.from(
+        new Set(
+          [
+            usernameInput.trim(),
+            norm.hasDomainAt ? '' : `${norm.bare}@${ldapCfg.domain}`,
+            norm.domainPrefix ? usernameInput.trim() : `${ldapCfg.domain.split('.')[0]}\\${norm.bare}`,
+          ].filter(Boolean)
+        )
+      );
+
+      for (const bindCandidate of bindCandidates) {
+        try {
+          await client.bind(bindCandidate, password);
+          userBound = true;
+          const escBare = escapeLdapFilter(norm.bare);
+          const escUpn = escapeLdapFilter(bindCandidate);
+          const { searchEntries } = await client.search(ldapCfg.baseDn, {
+            scope: 'sub',
+            filter: `(|(sAMAccountName=${escBare})(userPrincipalName=${escUpn})(mail=${escUpn}))`,
+            attributes: [
+              'dn',
+              'sAMAccountName',
+              'userPrincipalName',
+              'mail',
+              'displayName',
+              'cn',
+              'department',
+              'title',
+              'memberOf',
+            ],
+            sizeLimit: 1,
+          });
+          if (searchEntries.length > 0) {
+            foundEntry = searchEntries[0] as Record<string, unknown>;
+          }
+          break;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|Timeout/i.test(msg)) {
+            throw err;
+          }
+        }
+      }
+    }
+
+    if (!userBound) {
+      return { ok: false, invalidCredentials: true };
+    }
+
+    const sam = String(foundEntry?.sAMAccountName || norm.bare).toLowerCase();
+    const email = String(
+      foundEntry?.mail || foundEntry?.userPrincipalName || `${sam}@${ldapCfg.domain}`
+    ).toLowerCase();
+    const displayName = String(foundEntry?.displayName || foundEntry?.cn || sam);
+    const department = String(foundEntry?.department || 'Crystal Asfour AD');
+    const jobTitle = String(foundEntry?.title || 'Employee');
+    const roleHint = resolveRoleFromAdGroups(foundEntry?.memberOf, store.config);
+
+    return {
+      ok: true,
+      profile: {
+        username: sam,
+        email,
+        displayName,
+        department,
+        jobTitle,
+        adGroup: String(foundEntry?.dn || `CN=${sam},${ldapCfg.baseDn}`),
+        roleHint,
+      },
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|Timeout/i.test(msg)) {
+      return {
+        ok: false,
+        unreachable: true,
+        reason: `Active Directory LDAP server (${ldapCfg.ldapUrl}) is unreachable from this host.`,
+      };
+    }
+    return { ok: false, invalidCredentials: true };
+  } finally {
+    try {
+      await client.unbind();
+    } catch {
+      // Ignore cleanup error
+    }
+  }
 }
 
 async function getGraphAppToken(store: CqdStore): Promise<string | null> {
@@ -945,8 +1336,8 @@ export function createCqdApp(): Express {
     });
   });
 
-  // --- Standard AD / Admin Credentials Login ---
-  app.post('/api/auth/login', (req, res) => {
+  // --- Standard AD (Entra ID / LDAP) & Admin Credentials Login ---
+  app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body as { username?: string; password?: string };
     if (!username || !password) {
       res.status(400).json({ error: 'Username and password are required.' });
@@ -954,17 +1345,97 @@ export function createCqdApp(): Express {
     }
 
     const store = loadStore();
-    const q = username.trim().toLowerCase();
-    const user = store.users.find(
-      (u) => u.username.toLowerCase() === q || u.email.toLowerCase() === q
-    );
+    const norm = normalizeUsernameInput(username);
+
+    const findLocalUser = (bareName: string, fullInput: string) =>
+      store.users.find(
+        (u) =>
+          u.username.toLowerCase() === bareName ||
+          u.email.toLowerCase() === fullInput ||
+          u.email.split('@')[0].toLowerCase() === bareName
+      );
+
+    let user = findLocalUser(norm.bare, norm.rawLower);
 
     const isDefaultAdminMatch =
       user?.username === 'admin' &&
       (user.passwordHash === 'admin124' || user.passwordHash === 'admin1234') &&
       (password === 'admin124' || password === 'admin1234');
 
-    if (!user || (user.passwordHash !== password && !isDefaultAdminMatch)) {
+    let authMethodLabel: string = user?.authProvider || 'ActiveDirectory';
+
+    // 1. Local password match (Admin or local/provisioned password)
+    const localPasswordMatched = Boolean(
+      user && (user.passwordHash === password || isDefaultAdminMatch)
+    );
+
+    // 2. If not matched locally (and not local admin), try real Microsoft Entra ID & On-Premises LDAP
+    if (!localPasswordMatched && norm.bare !== 'admin') {
+      let externalResult: ExternalAdAuthResult = await authenticateViaEntraRopc(
+        store,
+        username.trim(),
+        password
+      );
+      if (externalResult.ok) {
+        authMethodLabel = 'AzureAD-ROPC';
+      } else if (!externalResult.mfaOrSsoRequired) {
+        const ldapResult = await authenticateViaLdap(store, username.trim(), password);
+        if (ldapResult.ok) {
+          externalResult = ldapResult;
+          authMethodLabel = 'LDAP-ActiveDirectory';
+        } else if (ldapResult.unreachable && !externalResult.invalidCredentials) {
+          externalResult = ldapResult;
+        }
+      }
+
+      if (externalResult.ok && externalResult.profile) {
+        const prof = externalResult.profile;
+        user =
+          findLocalUser(prof.username, prof.email) ??
+          (store.config.adSync.autoProvisionUsers
+            ? (() => {
+                const created: StoredUser = {
+                  id: `usr-${Date.now()}`,
+                  username: prof.username,
+                  passwordHash: crypto.randomBytes(16).toString('hex'),
+                  displayName: prof.displayName,
+                  displayNameAr: prof.displayName,
+                  email: prof.email,
+                  department: prof.department,
+                  jobTitle: prof.jobTitle,
+                  role: prof.roleHint,
+                  permissions: defaultPermissionsForRole(prof.roleHint),
+                  adGroup: prof.adGroup,
+                  authProvider: 'ActiveDirectory',
+                  active: true,
+                  mustChangePassword: false,
+                };
+                store.users.push(created);
+                return created;
+              })()
+            : undefined);
+
+        if (!user) {
+          res.status(403).json({
+            error: 'AD credentials verified, but user is not provisioned in CQD Admin Panel.',
+          });
+          return;
+        }
+      } else {
+        if (externalResult.mfaOrSsoRequired && externalResult.reason) {
+          res.status(401).json({ error: externalResult.reason });
+          return;
+        }
+        if (externalResult.unreachable && externalResult.reason) {
+          res.status(401).json({ error: externalResult.reason });
+          return;
+        }
+        res.status(401).json({ error: 'Invalid Active Directory or Admin credentials.' });
+        return;
+      }
+    }
+
+    if (!user) {
       res.status(401).json({ error: 'Invalid Active Directory or Admin credentials.' });
       return;
     }
@@ -981,10 +1452,10 @@ export function createCqdApp(): Express {
       actorUsername: user.username,
       actorRole: user.role,
       action: user.authProvider === 'LocalAdmin' ? 'ADMIN_LOGIN' : 'AD_LOGIN',
-      target: user.authProvider,
+      target: authMethodLabel,
       details: user.mustChangePassword
         ? 'Default admin authenticated — awaiting mandatory password rotation.'
-        : `Authenticated session via ${user.authProvider}.`,
+        : `Authenticated session via ${authMethodLabel}.`,
       ipAddress: '10.42.18.90',
     });
     saveStore(store);
@@ -1458,16 +1929,42 @@ export function createCqdApp(): Express {
     const { actorUsername } = req.body as { actorUsername?: string };
     const store = loadStore();
     const graphToken = await getGraphAppToken(store);
-    const ldapConfigured = Boolean(
-      store.config.adSync.ldapEndpoint &&
-        store.config.adSync.baseDn &&
-        store.config.adSync.bindDn
-    );
+    const ldapCfg = getLdapConfig(store);
+
+    let ldapLiveOk = false;
+    let ldapLiveMsg = '';
+    if (ldapCfg.isConfigured && ldapCfg.bindDn && ldapCfg.bindPassword) {
+      const client = new LdapClient({
+        url: ldapCfg.ldapUrl,
+        timeout: 4000,
+        connectTimeout: 4000,
+        strictDN: false,
+        tlsOptions: { rejectUnauthorized: false },
+      });
+      try {
+        await client.bind(ldapCfg.bindDn, ldapCfg.bindPassword);
+        ldapLiveOk = true;
+        ldapLiveMsg = `Live LDAPS bind succeeded (${ldapCfg.ldapUrl} / Base DN: ${ldapCfg.baseDn}).`;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        ldapLiveMsg = `LDAP connection error (${ldapCfg.ldapUrl}): ${msg}`;
+      } finally {
+        try {
+          await client.unbind();
+        } catch {
+          // ignore
+        }
+      }
+    }
 
     const status = graphToken
       ? 'Connected live to Microsoft Entra ID (Graph API token verified).'
-      : ldapConfigured
-      ? `On-Premises LDAPS configuration verified (${store.config.adSync.ldapEndpoint} / Base DN: ${store.config.adSync.baseDn}). Ready for enterprise network bind.`
+      : ldapLiveOk
+      ? ldapLiveMsg
+      : ldapLiveMsg
+      ? ldapLiveMsg
+      : ldapCfg.isConfigured && ldapCfg.bindDn
+      ? `On-Premises LDAPS configuration saved (${ldapCfg.ldapUrl} / Base DN: ${ldapCfg.baseDn}). Provide Bind Password to run live bind verification.`
       : 'Incomplete AD parameters. Please provide LDAP URL / Base DN or Azure AD Tenant & Client credentials.';
 
     store.auditLogs.unshift({
@@ -1476,22 +1973,27 @@ export function createCqdApp(): Express {
       actorUsername: actorUsername || 'admin',
       actorRole: 'System Admin',
       action: 'AD_CONNECTION_TESTED',
-      target: store.config.adSync.tenantDomain,
+      target: ldapCfg.domain,
       details: status,
       ipAddress: '10.42.1.10',
     });
     saveStore(store);
-    res.json({ ok: Boolean(graphToken || ldapConfigured), message: status, liveGraph: Boolean(graphToken) });
+    res.json({
+      ok: Boolean(graphToken || ldapLiveOk || (ldapCfg.isConfigured && !ldapLiveMsg)),
+      message: status,
+      liveGraph: Boolean(graphToken),
+      liveLdap: ldapLiveOk,
+    });
   });
 
-  // --- Live Active Directory User Search (Microsoft Graph or Synced AD Pool) ---
+  // --- Live Active Directory User Search (Microsoft Graph, LDAP, or Synced AD Pool) ---
   app.get('/api/admin/ad-search', async (req, res) => {
     const q = String(req.query.q || '').trim().toLowerCase();
     const store = loadStore();
     const existingEmails = new Set(store.users.map((u) => u.email.toLowerCase()));
     const existingUsernames = new Set(store.users.map((u) => u.username.toLowerCase()));
 
-    // Try Live Microsoft Graph Directory query if Azure AD App credentials are configured
+    // 1. Try Live Microsoft Graph Directory query if Azure AD App credentials are configured
     const graphToken = await getGraphAppToken(store);
     if (graphToken && q.length >= 2) {
       try {
@@ -1532,11 +2034,62 @@ export function createCqdApp(): Express {
           return;
         }
       } catch {
-        // Fallback to local AD catalog
+        // Fallback to LDAP / local AD catalog
       }
     }
 
-    // Fallback / Hybrid Corporate AD Pool search
+    // 2. Try Live On-Premises LDAP Directory Search if configured with bind credentials
+    const ldapCfg = getLdapConfig(store);
+    if (ldapCfg.isConfigured && ldapCfg.bindDn && ldapCfg.bindPassword && q.length >= 2) {
+      const client = new LdapClient({
+        url: ldapCfg.ldapUrl,
+        timeout: 4000,
+        connectTimeout: 4000,
+        strictDN: false,
+        tlsOptions: { rejectUnauthorized: false },
+      });
+      try {
+        await client.bind(ldapCfg.bindDn, ldapCfg.bindPassword);
+        const esc = escapeLdapFilter(q);
+        const { searchEntries } = await client.search(ldapCfg.baseDn, {
+          scope: 'sub',
+          filter: `(&(objectClass=user)(|(sAMAccountName=*${esc}*)(displayName=*${esc}*)(mail=*${esc}*)))`,
+          attributes: ['dn', 'sAMAccountName', 'userPrincipalName', 'mail', 'displayName', 'cn', 'department', 'title'],
+          sizeLimit: 15,
+        });
+        if (searchEntries.length > 0) {
+          const results: AdDirectoryCandidate[] = searchEntries.map((entry) => {
+            const sam = String(entry.sAMAccountName || 'ad.user').toLowerCase();
+            const email = String(entry.mail || entry.userPrincipalName || `${sam}@${ldapCfg.domain}`).toLowerCase();
+            const displayName = String(entry.displayName || entry.cn || sam);
+            return {
+              username: sam,
+              displayName,
+              displayNameAr: displayName,
+              email,
+              department: String(entry.department || 'Crystal Asfour AD'),
+              jobTitle: String(entry.title || 'Employee'),
+              adGroup: String(entry.dn || ldapCfg.baseDn),
+              alreadyProvisioned:
+                existingEmails.has(email) || existingUsernames.has(sam),
+              source: 'SyncedAdDirectory',
+            };
+          });
+          res.json({ candidates: results, source: 'LiveLDAP' });
+          return;
+        }
+      } catch {
+        // Fallback to local AD pool
+      } finally {
+        try {
+          await client.unbind();
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // 3. Fallback / Hybrid Corporate AD Pool search
     const results: AdDirectoryCandidate[] = CORPORATE_AD_DIRECTORY_POOL.filter((item) => {
       if (!q) return true;
       return (

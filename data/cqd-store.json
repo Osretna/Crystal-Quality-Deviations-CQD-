@@ -13,7 +13,7 @@
       "authProvider": "LocalAdmin",
       "active": true,
       "mustChangePassword": false,
-      "lastLoginAt": "2026-11-17T21:25:23.494Z",
+      "lastLoginAt": "2026-11-18T05:32:49.030Z",
       "permissions": {
         "canCreateDeviation": true,
         "canViewAllDeviations": true,
@@ -57,7 +57,7 @@
       "authProvider": "ActiveDirectory",
       "active": true,
       "mustChangePassword": false,
-      "lastLoginAt": "2026-11-17T07:00:00.000Z",
+      "lastLoginAt": "2026-11-18T05:32:49.048Z",
       "permissions": {
         "canCreateDeviation": true,
         "canViewAllDeviations": true,
@@ -483,6 +483,26 @@
     }
   ],
   "auditLogs": [
+    {
+      "id": "aud-1794979969048",
+      "timestamp": "2026-11-18T05:32:49.048Z",
+      "actorUsername": "m.hassan",
+      "actorRole": "Quality Inspector",
+      "action": "AD_LOGIN",
+      "target": "ActiveDirectory",
+      "details": "Authenticated session via ActiveDirectory.",
+      "ipAddress": "10.42.18.90"
+    },
+    {
+      "id": "aud-1794979969030",
+      "timestamp": "2026-11-18T05:32:49.030Z",
+      "actorUsername": "admin",
+      "actorRole": "System Admin",
+      "action": "ADMIN_LOGIN",
+      "target": "LocalAdmin",
+      "details": "Authenticated session via LocalAdmin.",
+      "ipAddress": "10.42.18.90"
+    },
     {
       "id": "aud-1794950723494",
       "timestamp": "2026-11-17T21:25:23.494Z",
