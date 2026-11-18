@@ -794,6 +794,11 @@ function getAzureCredentials(store: CqdStore) {
     process.env.AZURE_AD_TENANT_ID ||
     process.env.AZURE_TENANT_ID ||
     process.env.TENANT_ID ||
+    process.env.ENTRA_TENANT_ID ||
+    process.env.MICROSOFT_TENANT_ID ||
+    process.env.AD_TENANT_ID ||
+    process.env.VITE_AZURE_AD_TENANT_ID ||
+    process.env.NEXT_PUBLIC_AZURE_AD_TENANT_ID ||
     store.config.adSync.tenantId ||
     ''
   ).trim();
@@ -801,6 +806,11 @@ function getAzureCredentials(store: CqdStore) {
     process.env.AZURE_AD_CLIENT_ID ||
     process.env.AZURE_CLIENT_ID ||
     process.env.CLIENT_ID ||
+    process.env.ENTRA_CLIENT_ID ||
+    process.env.MICROSOFT_CLIENT_ID ||
+    process.env.AD_CLIENT_ID ||
+    process.env.VITE_AZURE_AD_CLIENT_ID ||
+    process.env.NEXT_PUBLIC_AZURE_AD_CLIENT_ID ||
     store.config.adSync.clientId ||
     ''
   ).trim();
@@ -808,12 +818,16 @@ function getAzureCredentials(store: CqdStore) {
     process.env.AZURE_AD_CLIENT_SECRET ||
     process.env.AZURE_CLIENT_SECRET ||
     process.env.CLIENT_SECRET ||
+    process.env.ENTRA_CLIENT_SECRET ||
+    process.env.MICROSOFT_CLIENT_SECRET ||
+    process.env.AD_CLIENT_SECRET ||
     store.adClientSecret ||
     ''
   ).trim();
   const redirectUri = (
     process.env.AZURE_AD_REDIRECT_URI ||
     process.env.AZURE_REDIRECT_URI ||
+    process.env.ENTRA_REDIRECT_URI ||
     store.config.adSync.redirectUri ||
     ''
   ).trim();
@@ -828,45 +842,84 @@ function getAzureCredentials(store: CqdStore) {
 }
 
 function getLdapConfig(store: CqdStore) {
+  const defaultPlaceholders = new Set([
+    'ldaps://dc01.asfourcrystal.com:636',
+    'ldaps://dc01.corp.crystalasfour.com:636',
+  ]);
+  const envUrl = (
+    process.env.LDAP_URL ||
+    process.env.LDAP_ENDPOINT ||
+    process.env.AD_LDAP_URL ||
+    process.env.LDAP_URI ||
+    ''
+  ).trim();
+  const envHost = (
+    process.env.LDAP_HOST ||
+    process.env.AD_SERVER_IP ||
+    process.env.DOMAIN_CONTROLLER_IP ||
+    ''
+  ).trim();
+  const savedEndpoint = (store.config.adSync.ldapEndpoint || '').trim();
+  const savedIp = (store.config.adSync.domainControllerIp || '').trim();
+  const isCustomSavedIp = Boolean(savedIp && savedIp !== '10.42.1.10');
+
+  let ldapUrl = envUrl;
+  if (!ldapUrl && envHost) {
+    ldapUrl = /^ldaps?:\/\//i.test(envHost) ? envHost : `ldaps://${envHost}:636`;
+  }
+  if (!ldapUrl) {
+    if (savedEndpoint && (!defaultPlaceholders.has(savedEndpoint) || !isCustomSavedIp)) {
+      ldapUrl = savedEndpoint;
+    } else if (savedIp) {
+      ldapUrl = `ldaps://${savedIp}:636`;
+    }
+  }
+
   const domain = (
     process.env.AD_DOMAIN ||
     process.env.TENANT_DOMAIN ||
     store.config.adSync.tenantDomain ||
-    'crystalasfour.com'
-  ).trim();
-  const ldapUrl = (
-    process.env.LDAP_URL ||
-    process.env.LDAP_ENDPOINT ||
-    process.env.AD_LDAP_URL ||
-    store.config.adSync.ldapEndpoint ||
-    (store.config.adSync.domainControllerIp
-      ? `ldaps://${store.config.adSync.domainControllerIp.trim()}:636`
-      : '')
+    'asfourcrystal.com'
   ).trim();
   const baseDn = (
     process.env.LDAP_BASE_DN ||
     process.env.AD_BASE_DN ||
+    process.env.BASE_DN ||
     store.config.adSync.baseDn ||
     ''
   ).trim();
   const bindDn = (
     process.env.LDAP_BIND_DN ||
     process.env.AD_BIND_DN ||
+    process.env.BIND_DN ||
+    process.env.LDAP_USERNAME ||
     store.config.adSync.bindDn ||
     ''
   ).trim();
   const bindPassword = (
     process.env.LDAP_BIND_PASSWORD ||
     process.env.AD_BIND_PASSWORD ||
+    process.env.BIND_PASSWORD ||
+    process.env.LDAP_PASSWORD ||
     store.adBindPassword ||
     ''
   ).trim();
+
+  const hasExplicitLdapConfig = Boolean(
+    envUrl ||
+      envHost ||
+      bindPassword ||
+      isCustomSavedIp ||
+      (savedEndpoint && !defaultPlaceholders.has(savedEndpoint))
+  );
+
   return {
     domain,
     ldapUrl,
     baseDn,
     bindDn,
     bindPassword,
+    hasExplicitLdapConfig,
     isConfigured: Boolean(ldapUrl && baseDn),
   };
 }
@@ -959,7 +1012,19 @@ async function authenticateViaEntraRopc(
   const domain = getLdapConfig(store).domain;
   const candidates = norm.hasDomainAt
     ? [usernameInput.trim()]
-    : Array.from(new Set([`${norm.bare}@${domain}`, usernameInput.trim()]));
+    : Array.from(
+        new Set(
+          [
+            `${norm.bare}@${domain}`,
+            `${norm.bare}@asfourcrystal.com`,
+            `${norm.bare}@crystalasfour.com`,
+            usernameInput.trim(),
+          ].filter(Boolean)
+        )
+      );
+
+  let sawInvalidCredentials = false;
+  let lastPolicyReason: string | undefined;
 
   for (const candidate of candidates) {
     try {
@@ -1034,25 +1099,48 @@ async function authenticateViaEntraRopc(
       const codes = json.error_codes || [];
       // MFA / Conditional Access / Consent required -> direct user to SSO button
       if (
-        codes.some((c) => [50076, 50079, 53003, 65001, 7000218].includes(c)) ||
+        codes.some((c) => [50076, 50079, 53003, 50158, 65001, 7000218].includes(c)) ||
         json.error === 'interaction_required'
       ) {
         return {
           ok: false,
           mfaOrSsoRequired: true,
           reason:
-            'Microsoft Active Directory requires interactive SSO/MFA sign-in. Please use the Microsoft Active Directory SSO button below.',
+            'Microsoft Active Directory requires interactive SSO/MFA sign-in. Please use the "Sign in with Microsoft Active Directory" button below.',
         };
       }
 
-      if (codes.some((c) => [50126, 50034].includes(c)) || json.error === 'invalid_grant') {
-        return { ok: false, invalidCredentials: true };
+      if (codes.some((c) => [700016, 90002, 7000215].includes(c))) {
+        lastPolicyReason =
+          json.error_description?.split('\r\n')[0] ||
+          'Microsoft Entra ID application configuration mismatch (Tenant ID / Client ID / Secret).';
+        break;
+      }
+
+      // 50034 = user UPN not found under this suffix -> continue trying other domain suffixes
+      if (codes.includes(50034)) {
+        continue;
+      }
+
+      if (codes.some((c) => [50126, 50053, 50057].includes(c)) || json.error === 'invalid_grant') {
+        sawInvalidCredentials = true;
+        if (codes.includes(50053)) {
+          lastPolicyReason = 'Active Directory account is locked.';
+        } else if (codes.includes(50057)) {
+          lastPolicyReason = 'Active Directory account is disabled.';
+        }
       }
     } catch {
       return { ok: false, unreachable: true };
     }
   }
 
+  if (lastPolicyReason) {
+    return { ok: false, invalidCredentials: true, reason: lastPolicyReason };
+  }
+  if (sawInvalidCredentials) {
+    return { ok: false, invalidCredentials: true };
+  }
   return { ok: false };
 }
 
@@ -1182,11 +1270,11 @@ async function authenticateViaLdap(
     };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|Timeout/i.test(msg)) {
+    if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|EAI_AGAIN|Timeout/i.test(msg)) {
       return {
         ok: false,
         unreachable: true,
-        reason: `Active Directory LDAP server (${ldapCfg.ldapUrl}) is unreachable from this host.`,
+        reason: `Active Directory LDAP server (${ldapCfg.ldapUrl}) is an internal/private address unreachable from Vercel cloud. Either configure Microsoft Entra ID (Azure AD) env vars, expose LDAPS publicly on port 636, or host the app inside the company network.`,
       };
     }
     return { ok: false, invalidCredentials: true };
@@ -1323,6 +1411,7 @@ function generateNextDeviationId(deviations: DeviationRecord[]): string {
 
 export function createCqdApp(): Express {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '10mb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -1371,6 +1460,9 @@ export function createCqdApp(): Express {
 
     // 2. If not matched locally (and not local admin), try real Microsoft Entra ID & On-Premises LDAP
     if (!localPasswordMatched && norm.bare !== 'admin') {
+      const azureCreds = getAzureCredentials(store);
+      const ldapCfg = getLdapConfig(store);
+
       let externalResult: ExternalAdAuthResult = await authenticateViaEntraRopc(
         store,
         username.trim(),
@@ -1378,12 +1470,15 @@ export function createCqdApp(): Express {
       );
       if (externalResult.ok) {
         authMethodLabel = 'AzureAD-ROPC';
-      } else if (!externalResult.mfaOrSsoRequired) {
+      } else if (
+        !externalResult.mfaOrSsoRequired &&
+        (!azureCreds.hasTenantAndClient || ldapCfg.hasExplicitLdapConfig)
+      ) {
         const ldapResult = await authenticateViaLdap(store, username.trim(), password);
         if (ldapResult.ok) {
           externalResult = ldapResult;
           authMethodLabel = 'LDAP-ActiveDirectory';
-        } else if (ldapResult.unreachable && !externalResult.invalidCredentials) {
+        } else if (ldapResult.unreachable && !externalResult.invalidCredentials && !externalResult.reason) {
           externalResult = ldapResult;
         }
       }
@@ -1422,11 +1517,7 @@ export function createCqdApp(): Express {
           return;
         }
       } else {
-        if (externalResult.mfaOrSsoRequired && externalResult.reason) {
-          res.status(401).json({ error: externalResult.reason });
-          return;
-        }
-        if (externalResult.unreachable && externalResult.reason) {
+        if ((externalResult.mfaOrSsoRequired || externalResult.unreachable || externalResult.reason) && externalResult.reason) {
           res.status(401).json({ error: externalResult.reason });
           return;
         }

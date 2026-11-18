@@ -13,7 +13,7 @@
       "authProvider": "LocalAdmin",
       "active": true,
       "mustChangePassword": false,
-      "lastLoginAt": "2026-11-18T05:32:49.030Z",
+      "lastLoginAt": "2026-11-18T05:46:17.223Z",
       "permissions": {
         "canCreateDeviation": true,
         "canViewAllDeviations": true,
@@ -483,6 +483,16 @@
     }
   ],
   "auditLogs": [
+    {
+      "id": "aud-1794980777223",
+      "timestamp": "2026-11-18T05:46:17.223Z",
+      "actorUsername": "admin",
+      "actorRole": "System Admin",
+      "action": "ADMIN_LOGIN",
+      "target": "LocalAdmin",
+      "details": "Authenticated session via LocalAdmin.",
+      "ipAddress": "10.42.18.90"
+    },
     {
       "id": "aud-1794979969048",
       "timestamp": "2026-11-18T05:32:49.048Z",
